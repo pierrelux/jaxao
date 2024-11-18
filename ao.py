@@ -132,66 +132,77 @@ class ShackHartmannWFS(eqx.Module):
         return psf / psf.sum()
     
     def measure_slopes(
-        self, 
-        phase_screen: jnp.ndarray, 
+        self,
+        phase_screen: jnp.ndarray,
         valid_subaps: jnp.ndarray
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """Measure wavefront slopes from phase screen"""
+        """Measure wavefront slopes from phase screen using vectorized operations."""
         n_subapertures = self.geometry.n_subapertures
+        pixels_per_subap = self.geometry.pixels_per_subap
         subap_centers_x, subap_centers_y = self.geometry.subap_centers
         
-        # Initialize output arrays
-        slopes_x = jnp.zeros((n_subapertures, n_subapertures))
-        slopes_y = jnp.zeros((n_subapertures, n_subapertures))
-        centroids_x = jnp.zeros((n_subapertures, n_subapertures))
-        centroids_y = jnp.zeros((n_subapertures, n_subapertures))
+        # Calculate base coordinates for all subapertures
+        x_starts = jnp.array(
+            (subap_centers_x + self.geometry.d_subap*n_subapertures/2) /
+            (self.geometry.diameter/self.geometry.resolution)
+        ).astype(jnp.int32)
         
-        for i in range(n_subapertures):
-            for j in range(n_subapertures):
-                if not valid_subaps[i, j]:
-                    continue
+        y_starts = jnp.array(
+            (subap_centers_y + self.geometry.d_subap*n_subapertures/2) /
+            (self.geometry.diameter/self.geometry.resolution)
+        ).astype(jnp.int32)
+        
+        def compute_subaperture_slopes(y_start, x_start, i, j):
+            """Compute slopes for a single subaperture"""
+            # Extract subaperture phase
+            subap_phase = jax.lax.dynamic_slice(
+                phase_screen,
+                (y_start, x_start),
+                (pixels_per_subap, pixels_per_subap)
+            )
+            
+            # Compute gradients
+            dx = self.geometry.d_subap / self.geometry.pixel_coords[0].shape[0]
+            grad_y, grad_x = jnp.gradient(subap_phase, dx)
+            slope_x = jnp.mean(grad_x)
+            slope_y = jnp.mean(grad_y)
+            
+            # Compute PSF and centroids
+            psf = self.compute_psf(slope_x, slope_y)
+            cy, cx = self.calculate_centroid(psf)
+            
+            # Add reference centroids correctly
+            centroid_x = cx + self.geometry.reference_centroids[j]
+            centroid_y = cy + self.geometry.reference_centroids[i]
+            
+            return slope_x, slope_y, centroid_x, centroid_y
+        
+        # Vectorized map over all subapertures
+        def process_row(i):
+            def process_col(j):
+                y_start, x_start = y_starts[i, j], x_starts[i, j]
+                slopes = compute_subaperture_slopes(y_start, x_start, i, j)
                 
-                # Calculate slice positions
-                x_start = jnp.array(
-                    (subap_centers_x[i,j] + 
-                    self.geometry.d_subap*n_subapertures/2) / 
-                    (self.geometry.diameter/self.geometry.resolution),
-                    dtype=jnp.int32
+                # Apply valid_subaps mask
+                masked_slopes = jax.tree_map(
+                    lambda x: jnp.where(valid_subaps[i, j], x, 0.0),
+                    slopes
                 )
-                y_start = jnp.array(
-                    (subap_centers_y[i,j] + 
-                    self.geometry.d_subap*n_subapertures/2) / 
-                    (self.geometry.diameter/self.geometry.resolution),
-                    dtype=jnp.int32
-                )
+                return masked_slopes
                 
-                # Get subaperture phase
-                subap_phase = jax.lax.dynamic_slice(
-                    phase_screen,
-                    (y_start, x_start),
-                    (self.geometry.pixels_per_subap, self.geometry.pixels_per_subap)
-                )
-                
-                # Compute gradients
-                dx = self.geometry.d_subap / self.geometry.pixel_coords[0].shape[0]
-                grad_y, grad_x = jnp.gradient(subap_phase, dx)
-                slope_x = jnp.mean(grad_x)
-                slope_y = jnp.mean(grad_y)
-                
-                # Compute PSF and centroids
-                psf = self.compute_psf(slope_x, slope_y)
-                cy, cx = self.calculate_centroid(psf)
-                centroid_x = self.geometry.reference_centroids[j] + cx
-                centroid_y = self.geometry.reference_centroids[i] + cy
-                
-                # Update arrays
-                slopes_x = slopes_x.at[i, j].set(slope_x)
-                slopes_y = slopes_y.at[i, j].set(slope_y)
-                centroids_x = centroids_x.at[i, j].set(centroid_x)
-                centroids_y = centroids_y.at[i, j].set(centroid_y)
+            return jax.vmap(process_col)(jnp.arange(n_subapertures))
+        
+        # Map over all rows
+        results = jax.vmap(process_row)(jnp.arange(n_subapertures))
+        
+        # Reshape results
+        slopes_x = results[0]
+        slopes_y = results[1]
+        centroids_x = results[2]  # Reference centroids already added in compute_subaperture_slopes
+        centroids_y = results[3]  # Reference centroids already added in compute_subaperture_slopes
         
         return slopes_x, slopes_y, centroids_x, centroids_y
-
+    
 class WavefrontReconstructor(eqx.Module):
     """Southwell reconstructor implemented as an Equinox Module"""
     d_subap: float
